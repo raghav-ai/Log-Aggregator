@@ -1,0 +1,172 @@
+{
+  "title": "System Health",
+  "uid": "logagg-system-health",
+  "schemaVersion": 38,
+  "refresh": "5s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Throughput (logs/sec by level)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "sum by (level) (rate(logs_total[1m]))",
+          "legendFormat": "{{level}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Error Rate (5xx / total)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "rate(logs_total{status_code=~\"5..\"}[1m]) / rate(logs_total[1m])",
+          "legendFormat": "error rate"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Response Time (p50 / p99)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.50, sum(rate(response_time_seconds_bucket[1m])) by (le)) * 1000",
+          "legendFormat": "p50"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.99, sum(rate(response_time_seconds_bucket[1m])) by (le)) * 1000",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Status Code Breakdown",
+      "type": "piechart",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "sum by (status_code) (rate(logs_total[5m]))",
+          "legendFormat": "{{status_code}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Logs Per Second (Live)",
+      "description": "Per-second log throughput derived from the logs_total counter.",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "logs/s",
+          "custom": {
+            "fillOpacity": 10
+          }
+        }
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "sum(rate(logs_total[1m]))",
+          "legendFormat": "logs/sec"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Kafka Consumer Lag (Backpressure)",
+      "description": "Alert threshold: 500 messages. High lag indicates the consumer cannot keep up with the producer.",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 100 },
+              { "color": "red", "value": 500 }
+            ]
+          },
+          "custom": {
+            "thresholdsStyle": { "mode": "line+area" }
+          }
+        }
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "kafka_consumer_lag",
+          "legendFormat": "{{topic}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "DLQ Messages (Malformed Logs)",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 24, "w": 6, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 10 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "dlq_messages_total",
+          "legendFormat": "DLQ total"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Throughput by Service",
+      "type": "timeseries",
+      "gridPos": { "x": 6, "y": 24, "w": 9, "h": 8 },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "sum by (service) (rate(logs_total[1m]))",
+          "legendFormat": "{{service}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "DLQ Rate (malformed/sec)",
+      "type": "timeseries",
+      "gridPos": { "x": 15, "y": 24, "w": 9, "h": 8 },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "rate(dlq_messages_total[1m])",
+          "legendFormat": "dlq/sec"
+        }
+      ]
+    }
+  ]
+}
