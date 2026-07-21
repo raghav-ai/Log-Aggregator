@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,9 +12,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	kafka "github.com/segmentio/kafka-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	kafka "github.com/segmentio/kafka-go"
 )
 
 type LogEntry struct {
@@ -71,7 +72,26 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-func openLogFile(path string) *os.File {
+func getEnvInt(key string, fallback int) int {
+	v, err := strconv.Atoi(getEnv(key, ""))
+	if err != nil || v < 1 {
+		return fallback
+	}
+	return v
+}
+
+// bufferedLog serializes concurrent writes from the worker pool behind a large
+// buffer. Unbuffered per-message encoding costs one write syscall per log, which
+// alone caps throughput well below 30k/s.
+type bufferedLog struct {
+	mu      sync.Mutex
+	buf     *bufio.Writer
+	enc     *json.Encoder
+	sampleN int64
+	seen    int64
+}
+
+func newBufferedLog(path string) *bufferedLog {
 	if err := os.MkdirAll("/app/logs", 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create logs dir: %v\n", err)
 		os.Exit(1)
@@ -81,7 +101,32 @@ func openLogFile(path string) *os.File {
 		fmt.Fprintf(os.Stderr, "failed to open log file %s: %v\n", path, err)
 		os.Exit(1)
 	}
-	return f
+	buf := bufio.NewWriterSize(f, 1024*1024)
+	bl := &bufferedLog{buf: buf, enc: json.NewEncoder(buf), sampleN: 1}
+	go func() {
+		for range time.NewTicker(1 * time.Second).C {
+			bl.mu.Lock()
+			bl.buf.Flush()
+			bl.mu.Unlock()
+		}
+	}()
+	return bl
+}
+
+func (b *bufferedLog) encode(v any) {
+	b.mu.Lock()
+	b.enc.Encode(v)
+	b.mu.Unlock()
+}
+
+// encodeSampled keeps 1-in-sampleN entries. At 30k/s, writing every log to the
+// host volume is ~16GB/hour with no rotation; Kafka and Prometheus still see
+// 100% of the stream, these files are for eyeballing.
+func (b *bufferedLog) encodeSampled(v any) {
+	if b.sampleN > 1 && atomic.AddInt64(&b.seen, 1)%b.sampleN != 0 {
+		return
+	}
+	b.encode(v)
 }
 
 type msgWithTopic struct {
@@ -95,9 +140,17 @@ func startReader(broker, topic string, ch chan<- msgWithTopic, wg *sync.WaitGrou
 		Topic:       topic,
 		GroupID:     "logagg-consumer",
 		StartOffset: kafka.LastOffset,
-		MinBytes:    1,
-		MaxBytes:    10e6,
-		MaxWait:     500 * time.Millisecond,
+		// MinBytes:1 makes the broker answer every fetch immediately with
+		// whatever it has; batching fetches is far cheaper at high volume.
+		MinBytes:      10e3,
+		MaxBytes:      10e6,
+		MaxWait:       200 * time.Millisecond,
+		QueueCapacity: 1000,
+		// Without this, kafka-go commits the offset synchronously on every
+		// ReadMessage — a broker round-trip per log, and the hard ceiling on
+		// this pipeline. Batching commits trades at-most-1s of replay on
+		// restart for roughly two orders of magnitude more throughput.
+		CommitInterval: 1 * time.Second,
 	})
 
 	go func() {
@@ -121,30 +174,48 @@ func startReader(broker, topic string, ch chan<- msgWithTopic, wg *sync.WaitGrou
 	}()
 }
 
+var (
+	windowTotal  int64
+	windowErrors int64
+	secondCount  int64
+	badCount     int64
+)
+
 func main() {
 	broker := getEnv("KAFKA_BROKER", "localhost:9092")
 	metricsPort := getEnv("METRICS_PORT", "8080")
+	workers := getEnvInt("CONSUMER_WORKERS", 8)
 
 	topics := []string{"logs.info", "logs.warn", "logs.error"}
 
 	dlqWriter := &kafka.Writer{
 		Addr:                   kafka.TCP(broker),
 		Topic:                  "logs.dlq",
-		Balancer:               &kafka.LeastBytes{},
+		Balancer:               &kafka.RoundRobin{},
+		Async:                  true,
+		BatchSize:              100,
+		BatchTimeout:           10 * time.Millisecond,
+		RequiredAcks:           kafka.RequireOne,
 		AllowAutoTopicCreation: true,
 	}
 	defer dlqWriter.Close()
 
-	// fan-out log files, one per topic + one for DLQ
-	logFiles := map[string]*json.Encoder{
-		"logs.info":  json.NewEncoder(openLogFile("/app/logs/info.log")),
-		"logs.warn":  json.NewEncoder(openLogFile("/app/logs/warn.log")),
-		"logs.error": json.NewEncoder(openLogFile("/app/logs/error.log")),
-		"logs.dlq":   json.NewEncoder(openLogFile("/app/logs/dlq.log")),
+	// fan-out log files, one per topic + one for DLQ. The severity files are
+	// sampled; the DLQ file keeps every entry since it is low-volume and is the
+	// record of what actually failed.
+	fileSampleN := int64(getEnvInt("LOG_FILE_SAMPLE_N", 100))
+	logFiles := map[string]*bufferedLog{
+		"logs.info":  newBufferedLog("/app/logs/info.log"),
+		"logs.warn":  newBufferedLog("/app/logs/warn.log"),
+		"logs.error": newBufferedLog("/app/logs/error.log"),
+		"logs.dlq":   newBufferedLog("/app/logs/dlq.log"),
+	}
+	for _, topic := range topics {
+		logFiles[topic].sampleN = fileSampleN
 	}
 
-	msgCh := make(chan msgWithTopic, 1000)
-	dlqCh := make(chan kafka.Message, 1000)
+	msgCh := make(chan msgWithTopic, 10000)
+	dlqCh := make(chan kafka.Message, 10000)
 	var wg sync.WaitGroup
 	for _, topic := range topics {
 		startReader(broker, topic, msgCh, &wg)
@@ -157,8 +228,6 @@ func main() {
 			}
 		}
 	}()
-
-	var windowTotal, windowErrors, secondCount int64
 
 	go func() {
 		for range time.NewTicker(10 * time.Second).C {
@@ -176,6 +245,16 @@ func main() {
 		}
 	}()
 
+	// At 30k/s the ~1% malformed stream is ~300 msg/s; logging each one to
+	// stderr floods the Docker log driver, so report a periodic count instead.
+	go func() {
+		for range time.NewTicker(10 * time.Second).C {
+			if n := atomic.SwapInt64(&badCount, 0); n > 0 {
+				fmt.Fprintf(os.Stderr, "[consumer] %d malformed messages routed to DLQ in last 10s\n", n)
+			}
+		}
+	}()
+
 	http.Handle("/metrics", promhttp.Handler())
 	go func() {
 		fmt.Fprintf(os.Stderr, "Metrics server listening on :%s\n", metricsPort)
@@ -185,48 +264,59 @@ func main() {
 		}
 	}()
 
-	fmt.Fprintf(os.Stderr, "Consumer started: broker=%s topics=%v\n", broker, topics)
+	fmt.Fprintf(os.Stderr, "Consumer started: broker=%s topics=%v workers=%d\n", broker, topics, workers)
 
 	validLevels := map[string]bool{"info": true, "warn": true, "error": true}
 
 	sendToDLQ := func(item msgWithTopic, reason string) {
 		dlqTotal.Inc()
-		logFiles["logs.dlq"].Encode(map[string]string{
+		atomic.AddInt64(&badCount, 1)
+		logFiles["logs.dlq"].encode(map[string]string{
 			"origin": item.topic,
 			"raw":    string(item.msg.Value),
 			"error":  reason,
 		})
+		// Carry headers through: the DLQ consumer's retry counter lives there,
+		// and dropping them would reset the count on every cycle.
 		dlqCh <- kafka.Message{
-			Key:   []byte(item.topic),
-			Value: item.msg.Value,
+			Key:     []byte(item.topic),
+			Value:   item.msg.Value,
+			Headers: item.msg.Headers,
 		}
 	}
 
-	for item := range msgCh {
-		var entry LogEntry
-		if err := json.Unmarshal(item.msg.Value, &entry); err != nil {
-			fmt.Fprintf(os.Stderr, "parse error on %s: %v\n", item.topic, err)
-			sendToDLQ(item, err.Error())
-			continue
-		}
+	var workerWg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		workerWg.Add(1)
+		go func() {
+			defer workerWg.Done()
+			for item := range msgCh {
+				var entry LogEntry
+				if err := json.Unmarshal(item.msg.Value, &entry); err != nil {
+					sendToDLQ(item, err.Error())
+					continue
+				}
 
-		if !validLevels[entry.Level] || entry.Service == "" || entry.StatusCode == 0 {
-			reason := fmt.Sprintf("missing required fields: level=%q service=%q status_code=%d", entry.Level, entry.Service, entry.StatusCode)
-			fmt.Fprintf(os.Stderr, "invalid entry on %s: %s\n", item.topic, reason)
-			sendToDLQ(item, reason)
-			continue
-		}
+				if !validLevels[entry.Level] || entry.Service == "" || entry.StatusCode == 0 {
+					reason := fmt.Sprintf("missing required fields: level=%q service=%q status_code=%d", entry.Level, entry.Service, entry.StatusCode)
+					sendToDLQ(item, reason)
+					continue
+				}
 
-		statusStr := strconv.Itoa(entry.StatusCode)
-		logsTotal.WithLabelValues(statusStr, entry.Method, entry.Level, entry.Service).Inc()
-		responseTimeHistogram.WithLabelValues(entry.Level).Observe(float64(entry.ResponseTimeMs) / 1000.0)
+				statusStr := strconv.Itoa(entry.StatusCode)
+				logsTotal.WithLabelValues(statusStr, entry.Method, entry.Level, entry.Service).Inc()
+				responseTimeHistogram.WithLabelValues(entry.Level).Observe(float64(entry.ResponseTimeMs) / 1000.0)
 
-		atomic.AddInt64(&secondCount, 1)
-		atomic.AddInt64(&windowTotal, 1)
-		if entry.StatusCode >= 500 {
-			atomic.AddInt64(&windowErrors, 1)
-		}
+				atomic.AddInt64(&secondCount, 1)
+				atomic.AddInt64(&windowTotal, 1)
+				if entry.StatusCode >= 500 {
+					atomic.AddInt64(&windowErrors, 1)
+				}
 
-		logFiles["logs."+entry.Level].Encode(entry)
+				logFiles["logs."+entry.Level].encodeSampled(entry)
+			}
+		}()
 	}
+
+	workerWg.Wait()
 }

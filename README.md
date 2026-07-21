@@ -260,8 +260,17 @@ kafka_consumer_lag
 The consumer forwards messages to `logs.dlq` when they fail JSON parsing or schema validation (missing `level`, `service`, or `status_code`). The producer intentionally injects ~1% malformed messages to exercise this path.
 
 The DLQ consumer (`dlq-consumer`) reads `logs.dlq` and:
-- **Retries** messages that are now parseable → republishes to `logs.{info,warn,error}`
-- **Drops** permanently malformed messages (logs to stderr for human review)
+- **Retries** messages that parse *and* pass the same schema validation the
+  consumer applies → republishes to `logs.{info,warn,error}` with an incremented
+  `x-retry-count` header
+- **Drops** messages that are unparseable, or that parse but still fail
+  validation — republishing those would only get them rejected again
+- **Gives up** after `maxRetries` (3) redeliveries
+
+The validation check here must stay in lockstep with the consumer's. If the DLQ
+consumer's check is the weaker of the two, any message in the gap is forwarded,
+rejected, and returned to the DLQ indefinitely — a feedback loop that is
+invisible at low rates but saturates the broker at 30k/s.
 
 All DLQ messages are also written to `./logs/dlq.log` with the origin topic and error reason.
 
@@ -295,15 +304,38 @@ docker compose start consumer
 
 Edit `.env` to tune behavior:
 
-| Variable          | Default      | Description                           |
-|-------------------|--------------|---------------------------------------|
-| `KAFKA_BROKER`    | `kafka:9092` | Kafka broker address                  |
-| `LOG_RATE_MS`     | `5`          | Delay between produced logs (ms)      |
-| `INGEST_PORT`     | `8082`       | Host port for the Ingest API          |
-| `PROMETHEUS_PORT` | `9090`       | Host port for Prometheus              |
-| `GRAFANA_PORT`    | `3000`       | Host port for Grafana                 |
+| Variable              | Default      | Description                                        |
+|-----------------------|--------------|----------------------------------------------------|
+| `KAFKA_BROKER`        | `kafka:9092` | Kafka broker address                               |
+| `LOG_RATE_PER_SEC`    | `30000`      | Target produce rate (messages/sec)                 |
+| `PRODUCER_WORKERS`    | `8`          | Goroutines generating and publishing logs          |
+| `PRODUCER_BATCH_SIZE` | `500`        | Messages per Kafka write batch                     |
+| `LOG_SAMPLE_N`        | `1000`       | Write 1-in-N produced entries to `producer.log`    |
+| `CONSUMER_WORKERS`    | `8`          | Goroutines validating and recording logs           |
+| `LOG_FILE_SAMPLE_N`   | `100`        | Write 1-in-N consumed entries to severity log files|
+| `METRICS_PORT`        | `8080`       | Consumer metrics port                              |
+| `INGEST_PORT`         | `8082`       | Host port for the Ingest API                       |
+| `PROMETHEUS_PORT`     | `9090`       | Host port for Prometheus                           |
+| `GRAFANA_PORT`        | `3000`       | Host port for Grafana                              |
 
-The consumer's metrics port (`METRICS_PORT`) defaults to `8080` and is not currently exposed in `.env`.
+### Throughput notes
+
+The pipeline is tuned to sustain 30k messages/sec end to end. The settings that
+matter most if you change the target:
+
+- **Partitions.** `KAFKA_NUM_PARTITIONS: 6` in `docker-compose.yml` sets how many
+  consumers in the group can read a topic in parallel. Auto-created topics
+  otherwise get one partition, which pins each topic to a single reader.
+- **Commit interval.** Both consumers set `CommitInterval: 1s`. Left unset,
+  kafka-go commits offsets synchronously on every message — one broker
+  round-trip per log, and the single hardest ceiling on this pipeline. The
+  trade-off is that a restart may replay up to a second of messages.
+- **File sampling.** At 30k/s, writing every entry to `logs/` is ~16GB/hour with
+  no rotation. `LOG_FILE_SAMPLE_N` and `LOG_SAMPLE_N` bound that; Kafka and
+  Prometheus still see 100% of the stream. Set either to `1` to log everything,
+  and add rotation if you do.
+- **Kafka retention** is capped by size (`KAFKA_LOG_RETENTION_BYTES`) so a long
+  run cannot fill the host disk.
 
 ---
 

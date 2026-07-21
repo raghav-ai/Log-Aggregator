@@ -33,10 +33,24 @@ func main() {
 	broker := getEnv("KAFKA_BROKER", "localhost:9092")
 	port := getEnv("INGEST_PORT", "8081")
 
+	// Writes stay synchronous so a failed publish still surfaces as a 500 to the
+	// caller, but BatchSize/BatchTimeout let concurrent in-flight requests
+	// coalesce into one broker round-trip instead of one round-trip each.
+	newWriter := func(topic string) *kafka.Writer {
+		return &kafka.Writer{
+			Addr:                   kafka.TCP(broker),
+			Topic:                  topic,
+			Balancer:               &kafka.RoundRobin{},
+			BatchSize:              100,
+			BatchTimeout:           10 * time.Millisecond,
+			RequiredAcks:           kafka.RequireOne,
+			AllowAutoTopicCreation: true,
+		}
+	}
 	writers := map[string]*kafka.Writer{
-		"info":  {Addr: kafka.TCP(broker), Topic: "logs.info", Balancer: &kafka.LeastBytes{}, AllowAutoTopicCreation: true},
-		"warn":  {Addr: kafka.TCP(broker), Topic: "logs.warn", Balancer: &kafka.LeastBytes{}, AllowAutoTopicCreation: true},
-		"error": {Addr: kafka.TCP(broker), Topic: "logs.error", Balancer: &kafka.LeastBytes{}, AllowAutoTopicCreation: true},
+		"info":  newWriter("logs.info"),
+		"warn":  newWriter("logs.warn"),
+		"error": newWriter("logs.error"),
 	}
 	for _, w := range writers {
 		defer w.Close()
